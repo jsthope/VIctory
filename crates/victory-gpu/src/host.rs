@@ -1356,35 +1356,52 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// page is not readable or a destination page not writable (the bytes
 /// before that page may have been copied).
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    kernel_read(src, dst, len).0
+}
+
+fn kernel_read(src: *const u8, dst: *mut u8, len: usize) -> (bool, usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
     // SAFETY: the destination is `len` bytes the caller may write, host
     // memory or title memory; the kernel checks both ranges, and a page it
     // cannot read or write fails the call instead of faulting.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    let ok =
+        unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) };
+    (ok != 0, done)
 }
 
 /// Copies host memory into title memory after a submission (what shaders
-/// wrote), leaving pages that are not mapped alone.
+/// wrote), leaving pages that are not writable alone. Returns the number
+/// of bytes actually copied.
 ///
-/// Through [`read`]: the kernel refuses an unmapped destination page as it
+/// Through [`kernel_read`]: the kernel refuses an unmapped destination page as it
 /// does a source page. `WriteProcessMemory` makes the same copy, but asks
 /// for the destination's region first, at `VirtualQuery`'s cost (see
 /// [`copy_mapped`]): 0.35 ms for each piece of the world's copy-back, 39 ms
 /// per frame.
-pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
-    let write = |at: usize, n: usize| read(src.wrapping_add(at - dst as usize), at as *mut u8, n);
-    if len == 0 || write(dst as usize, len) {
-        return;
+pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) -> usize {
+    let start = dst as usize;
+    write_pieces(start, len, |at, n| {
+        kernel_read(src.wrapping_add(at - start), at as *mut u8, n).1
+    })
+}
+
+fn write_pieces(start: usize, len: usize, mut write: impl FnMut(usize, usize) -> usize) -> usize {
+    if len == 0 {
+        return 0;
     }
-    for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
-            });
-        }
+    let mut total = write(start, len);
+    // Skip every prefix already reported by the kernel. Recover later
+    // mapped pieces without counting or copying any successful byte twice.
+    for_pieces(start + total, len - total, 64 << 10, |at, n| {
+        let done = write(at, n);
+        total += done;
+        for_pieces(at + done, n - done, 4 << 10, |at, n| {
+            total += write(at, n);
+        });
     });
+    total
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
@@ -1465,17 +1482,39 @@ mod title_copies {
     }
 
     #[test]
+    fn copy_back_retries_only_uncopied_bytes() {
+        const PAGE: usize = 4096;
+        let mut calls = Vec::new();
+        let copied = super::write_pieces(0, BLOCK + PAGE, |at, len| {
+            calls.push((at, len));
+            match at {
+                0 => BLOCK,
+                BLOCK => PAGE / 2,
+                _ => 0,
+            }
+        });
+        assert_eq!(copied, BLOCK + PAGE / 2);
+        assert_eq!(
+            calls,
+            [(0, BLOCK + PAGE), (BLOCK, PAGE), (BLOCK + PAGE / 2, PAGE / 2)]
+        );
+    }
+
+    #[test]
     fn copy_back_writes_mapped_pages_only() {
         let from = pattern();
         let to = holed(0xee);
-        write_mapped(to, from.as_ptr(), 3 * BLOCK);
+        assert_eq!(write_mapped(to, from.as_ptr(), 3 * BLOCK), 2 * BLOCK);
         assert_eq!(block(to, 0), &from[..BLOCK]);
         assert_eq!(block(to, 2), &from[2 * BLOCK..]);
         release(to);
         // Neither aligned nor whole: the bytes around the range stay.
         let to = holed(0xee);
         // SAFETY: inside the first block.
-        write_mapped(unsafe { to.add(100) }, from.as_ptr(), BLOCK - 300);
+        assert_eq!(
+            write_mapped(unsafe { to.add(100) }, from.as_ptr(), BLOCK - 300),
+            BLOCK - 300
+        );
         let first = block(to, 0);
         assert_eq!(first[100..BLOCK - 200], from[..BLOCK - 300]);
         let around = first[..100].iter().chain(&first[BLOCK - 200..]);
@@ -1488,7 +1527,10 @@ mod title_copies {
             unsafe { VirtualProtect(to.add(2 * BLOCK).cast(), BLOCK, PAGE_READONLY, &mut old) };
         assert_ne!(protected, 0);
         // SAFETY: the third block.
-        write_mapped(unsafe { to.add(2 * BLOCK) }, from.as_ptr(), BLOCK);
+        assert_eq!(
+            write_mapped(unsafe { to.add(2 * BLOCK) }, from.as_ptr(), BLOCK),
+            0
+        );
         assert!(block(to, 2).iter().all(|&b| b == 0xee));
         release(to);
     }

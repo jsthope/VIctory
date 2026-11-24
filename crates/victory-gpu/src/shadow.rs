@@ -202,7 +202,7 @@ impl Shadow {
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
             let mut title = vec![0u8; PIECE];
-            let mut synced = Vec::new();
+            let mut checked = Vec::new();
             let mut at = from;
             while at < to {
                 let n = (PIECE - (start + at) % PIECE).min(to - at);
@@ -211,7 +211,13 @@ impl Shadow {
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
                 let title = &mut title[..n];
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                if host != old {
+                    let page = (start + at) / PAGE;
+                    if !crate::host::read_into((start + at) as *const u8, title) {
+                        checked.push((page, false));
+                        at += n;
+                        continue;
+                    }
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
                     let mut changed = false;
@@ -222,12 +228,16 @@ impl Shadow {
                         }
                         *h = *t;
                     }
-                    if changed {
+                    let synced = if changed {
                         crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
-                    }
-                    synced.push((start + at) / PAGE);
+                        let done =
+                            crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                        written += done;
+                        done == n
+                    } else {
+                        true
+                    };
+                    checked.push((page, synced));
                 }
                 at += n;
             }
@@ -235,15 +245,27 @@ impl Shadow {
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).
             let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
-            if first < last
-                && !synced.is_empty()
+            let now = if first < last
+                && checked
+                    .iter()
+                    .any(|&(page, synced)| synced && (first..last).contains(&page))
                 && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
-                && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
             {
+                crate::watch::writes(first * PAGE, last * PAGE, true).map(|(now, _)| now)
+            } else {
+                None
+            };
+            if !checked.is_empty() {
                 let base = start / PAGE;
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
-                    copied[page - base] = now;
+                for (page, synced) in checked {
+                    if !synced {
+                        copied[page - base] = 0;
+                    } else if let Some(now) = now
+                        && (first..last).contains(&page)
+                    {
+                        copied[page - base] = now;
+                    }
                 }
             }
         }
@@ -496,4 +518,96 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod copy_back_tests {
+    use super::{PAGE, Shadow, host};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY,
+        PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
+    };
+
+    #[test]
+    fn partial_copy_back_counts_written_bytes_and_refreshes_the_shadow() {
+        const BLOCK: usize = 4096;
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        let Some(host) = host() else {
+            eprintln!("no D3D12 device; copy-back shadow control skipped");
+            return;
+        };
+        let (buffer, data) = host
+            .shared_buffer(PAGE as u64)
+            .expect("shared shadow buffer");
+        // SAFETY: the allocation is ours until the final VirtualFree.
+        unsafe {
+            let title = VirtualAlloc(
+                std::ptr::null(),
+                PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!title.is_null());
+            title.write_bytes(1, PAGE);
+            let at = title as usize;
+            let shadow = Shadow::new(buffer, data, 0, at as u64, PAGE as u64);
+            assert_eq!(shadow.update(at, PAGE), PAGE);
+            let epoch = shadow.copied.lock().unwrap()[0];
+            assert_ne!(epoch, 0);
+
+            shadow.writing(at, PAGE);
+            assert_eq!(shadow.copy_back(at, PAGE), 0);
+            assert_eq!(shadow.copied.lock().unwrap()[0], epoch);
+
+            shadow.writing(at, PAGE);
+            data.write(2);
+            data.add(BLOCK).write(3);
+            data.add(2 * BLOCK).write(4);
+            let mut old = 0;
+            assert_ne!(
+                VirtualProtect(title.add(BLOCK).cast(), BLOCK, PAGE_READONLY, &mut old),
+                0
+            );
+            let count = shadow.copy_back(at, PAGE);
+            assert_eq!(
+                [
+                    title.read(),
+                    title.add(BLOCK).read(),
+                    title.add(2 * BLOCK).read()
+                ],
+                [2, 1, 4]
+            );
+            assert_eq!(
+                shadow.copied.lock().unwrap()[0],
+                0,
+                "partial copy-back must invalidate an already-current shadow"
+            );
+            assert_eq!(count, PAGE - BLOCK);
+            assert_eq!(shadow.update(at, PAGE), PAGE);
+            assert_eq!(data.add(BLOCK).read(), 1);
+
+            shadow.writing(at, PAGE);
+            data.add(BLOCK).write(5);
+            assert_ne!(
+                VirtualProtect(title.add(BLOCK).cast(), BLOCK, PAGE_NOACCESS, &mut old),
+                0
+            );
+            assert_eq!(shadow.copy_back(at, PAGE), 0);
+            assert_eq!(
+                shadow.copied.lock().unwrap()[0],
+                0,
+                "refused read must invalidate an already-current shadow"
+            );
+            assert_ne!(
+                VirtualProtect(title.add(BLOCK).cast(), BLOCK, PAGE_READONLY, &mut old),
+                0
+            );
+            assert_eq!(shadow.update(at, PAGE), PAGE);
+            assert_eq!(data.add(BLOCK).read(), 1);
+
+            assert_ne!(VirtualFree(title.cast(), 0, MEM_RELEASE), 0);
+        }
+        eprintln!("copy-back shadow refresh control completed");
+    }
 }
